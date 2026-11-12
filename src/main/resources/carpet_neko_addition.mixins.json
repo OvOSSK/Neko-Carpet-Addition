@@ -1,0 +1,28 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "neko.voidwarehouse.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "mixins": [
+    "PrinterPlaceStateMixin",
+    "ItemUseMixin",
+    "BlockItemUseOnMixin",
+    "ServerPlayerGameModeMixin",
+    "ServerPlayerGameModeUseItemMixin",
+    "ServerGamePacketListenerImplMixin",
+    "PlayerInteractOnMixin",
+    "BlockPlacedByMixin",
+    "BlockRemovalMixin",
+    "HopperBlockEntityMixin",
+    "ContainerClassifierMixin",
+    "SlotMixin",
+    "ChatInputMixin",
+    "CraftResultMixin",
+    "ServerLevelAddEntityMixin",
+    "ServerPlayerGameModeDestroyMixin",
+    "PlayerLanguageMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

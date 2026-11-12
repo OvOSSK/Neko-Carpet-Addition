@@ -1,7 +1,26 @@
-// ===== 根聚合工程 =====
-// 本文件不定义任何业务构建逻辑，只负责聚合各版本子工程。
-// 真正的构建逻辑在各子模块（modern/26.3、versions/1.21.x、common）各自的 build.gradle 里。
+plugins { id 'fabric-loom' version '1.5.8' }
+version = '1.0.17-mc1.20.1'
+group = 'neko'
+base { archivesName = 'carpet-Neko-Addition' }
+repositories { maven { url 'https://masa.dy.fi/maven' }; mavenCentral() }
+dependencies {
+ minecraft 'com.mojang:minecraft:1.20.1'
+ mappings loom.officialMojangMappings()
+ modImplementation 'net.fabricmc:fabric-loader:0.16.14'
+ modImplementation 'carpet:fabric-carpet:1.20-1.4.112+v230608'
+ modImplementation 'net.fabricmc.fabric-api:fabric-api:0.92.2+1.20.1'
+}
 
-// 让根项目的 `build` 任务也顺带把所有已启用的版本子工程都构建一遍。
-// 用法：在仓库根目录跑 `./gradlew build` 即可构建全部已 include 的版本。
-defaultTasks 'build'
+java { withSourcesJar(); sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8'; options.release = 17 }
+processResources { inputs.property 'version', project.version; filesMatching('fabric.mod.json') { expand 'version': project.version } }
+jar { from('LICENSE') }
+
+
+tasks.withType(JavaCompile).configureEach { options.compilerArgs += ['-Xmaxerrs', '500'] }
+
+dependencies { testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'; testRuntimeOnly 'org.junit.platform:junit-platform-launcher' }
+test { useJUnitPlatform() }
+
+jar { from('PORT-NOTICE.txt') }
+
