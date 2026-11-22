@@ -15,3 +15,7 @@ code, name, artwork, or other upstream assets. The original copyright and
 MIT license notices are retained. The port is not an official upstream release.
 Port modifications are distributed under the MIT license as well.
 Third-party dependencies retain their respective licenses and attribution.
+
+2026-11-22 update by OvOSSK:
+Upstream snapshot: 866c72a5b91f44f45db3038d0a79d876de0410f3
+Minecraft 1.20.1 networking, NBT, recipe confirmation and UI adaptation.

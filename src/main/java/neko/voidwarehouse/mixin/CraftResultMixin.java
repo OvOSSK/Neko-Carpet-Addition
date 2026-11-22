@@ -3,9 +3,14 @@ package neko.voidwarehouse.mixin;
 import neko.voidwarehouse.VoidWarehouse;
 import neko.voidwarehouse.VoidWarehouseData;
 import neko.voidwarehouse.VoidWarehouseRecipeBook;
+import neko.voidwarehouse.VoidWarehouseRecipeNotice;
+import neko.voidwarehouse.VoidWarehouseRecipePrompt;
 import neko.voidwarehouse.VoidWarehouseRecipes;
+import neko.voidwarehouse.VoidWarehouseText;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.CraftingContainer;
 import net.minecraft.world.inventory.ResultSlot;
@@ -16,7 +21,11 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 「玩家亲手合成过什么」的唯一记录点 —— 挂在 {@code ResultSlot#onTake} 上。
@@ -54,6 +63,16 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(ResultSlot.class)
 public abstract class CraftResultMixin {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger("carpet_neko_addition/recipe");
+
+    /**
+     * 异常日志的条数预算。
+     *
+     * <p>一个「每次都抛」的坏配方会跟着每一次合成都抛，不封顶就是把日志刷穿 ——
+     * 而这个日志的用处只是「让人知道这里有东西坏了」，前几条就够了。</p>
+     */
+    private static final AtomicInteger WARN_BUDGET = new AtomicInteger(3);
+
     @Shadow
     @Final
     private CraftingContainer craftSlots;
@@ -88,9 +107,53 @@ public abstract class CraftResultMixin {
             if (data == null) {
                 return;
             }
-            data.learn(recipe);
-        } catch (RuntimeException ignored) {
-            // 见类注释「异常一律吞掉」：旁路记录失败绝不能影响合成本身
+            // ---- 问一句，还是直接记？ ----
+            // 1.0.17 起默认「问了才记」：合成这一刻<b>只发问、不写配方本</b>，等玩家点了才写。
+            // 三种情况不问（已记过 / 本满 / 玩家本局选过「总是记住」或对这条点过「不要」），
+            // 直接落到下面原来的老路，文案与节流一个字都不变。
+            //
+            // 「已经挂着同一条待确认」要单独判：shift 连合同一条配方会连续走到这里，
+            // 不拦的话每次合成都会再挂一条（并把前一条挤掉），聊天栏立刻刷屏。
+            if (player instanceof ServerPlayer asker
+                    && VoidWarehouseRecipePrompt.shouldAsk(asker, data, recipe,
+                            VoidWarehouseRecipeBook.MAX_RECIPES)) {
+                if (!VoidWarehouseRecipePrompt.isPending(asker, recipe)) {
+                    Component ask = VoidWarehouseRecipePrompt.ask(
+                            asker, VoidWarehouseText.isEnglish(asker), data, recipe,
+                            server.getTickCount());
+                    if (ask != null) {
+                        asker.sendSystemMessage(ask);
+                    }
+                }
+                return;
+            }
+            // ⚠️ 用 learnCapturingOthers 而不是自己写「先 recipesFor 再 learn」：
+            // 那个先后顺序写反了不会报错，只会让提示多列一条自己。固化进数据层之后
+            // 自检能直接断言「交出来的 othersBefore 里没有刚学的那条」。
+            VoidWarehouseData.LearnOutcome outcome = data.learnCapturingOthers(recipe);
+            // 提示在这里发，不塞进数据层：数据层的定位是纯状态，一旦它自己去
+            // sendSystemMessage 就绑死了「必须有真玩家」这个前提（自检跑不了、
+            // 打印机那种无人路径也没法复用）。同 PrinterRestockNetwork 的分层规矩。
+            // 整个方法体在 try/catch 里 —— 发消息炸了也不能让玩家合不成本。
+            if (player instanceof ServerPlayer serverPlayer) {
+                for (Component line : VoidWarehouseRecipeNotice.onCrafted(
+                        player.getUUID(), VoidWarehouseText.isEnglish(serverPlayer),
+                        outcome.result(), recipe, outcome.othersBefore(),
+                        data.recipeBookUsed(), VoidWarehouseRecipeBook.MAX_RECIPES,
+                        server.getTickCount())) {
+                    serverPlayer.sendSystemMessage(line);
+                }
+            }
+        } catch (RuntimeException ex) {
+            // 见类注释「异常一律吞掉」：旁路记录失败绝不能影响合成本身。
+            //
+            // 但「照样吞」不等于「一声不响」。1.0.17 的实机测试报过「合成后没有提示」，
+            // 能查的东西只有存档里那几条新配方 —— 日志里一个字都没有，因为异常被这里吞了，
+            // 于是「配方记下来了、提示没发出去」这种情况在事后完全无法与「一切正常」区分。
+            // 所以这里照样不影响合成，但要留一条痕迹；条数有预算，不会刷屏。
+            if (WARN_BUDGET.getAndDecrement() > 0) {
+                LOGGER.warn("虚空仓库：记录配方时抛异常，本次合成已照常完成（后续同类异常不再重复打印）", ex);
+            }
         }
     }
 }

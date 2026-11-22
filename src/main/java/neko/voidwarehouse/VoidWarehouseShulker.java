@@ -1,6 +1,5 @@
 package neko.voidwarehouse;
 
-
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.DyeColor;
 import net.minecraft.world.item.Item;
@@ -175,6 +174,32 @@ public final class VoidWarehouseShulker {
      */
     public static boolean isBoxable(ItemStack template) {
         return template != null && !template.isEmpty() && !isShulkerBox(template);
+    }
+
+    /**
+     * 这种物品本身是不是<b>做盒子的材料</b>（潜影壳 / 箱子）。
+     *
+     * <h2>为什么这两样的材料账要单独算</h2>
+     * <p>装盒的材料账（{@link VoidWarehouseData#planBoxMaterials}）是从<b>仓库</b>扣
+     * {@link #SHELL_COST} 壳 + {@link #CHEST_COST} 箱，而两个取货口都是
+     * <b>先把货取走、再扣材料</b>（顺序不能反：扣材料会移除别的格子、让下标前移）。</p>
+     *
+     * <p>于是「目标格本身就是潜影壳 / 箱子」时出现了<b>材料与货共源</b>：取走整整一盒容量
+     * （潜影壳 1728 个）之后，仓库里那 {@code 2} 个壳恰好归零，
+     * {@code consumeBoxMaterials} 再也扣不到 —— 它只会留一条 WARN，而这盒子是实打实
+     * 交到玩家手上的。算一笔账：仓库 1728 壳 + 1 箱、0 空盒，盒模式点壳那一格 → 拿到
+     * 「装着 1728 壳的盒子」，送回仓库变回 1728 壳 + <b>1 个空盒</b>。净效果 =
+     * <b>1 个箱子（8 木板）换 1 个潜影盒</b>，可无限循环；而原版要 2 壳 + 1 箱。</p>
+     *
+     * <p>所以取这两样时，材料账必须先<b>把「马上要离库的那批货」刨掉</b>（{@link VoidWarehouseData#hasBoxMaterials(BoxMaterials, ItemStack, BigInteger)}
+     * 与 {@link VoidWarehouseData#maxBoxesUpTo(long, ItemStack)}）—— 盒子照给，但成本只能从那批货<b>之外</b>的库存里出。
+     * {@link #pack} 绕过了原版 {@code canFitInsideContainerItems}，凡是能当材料的东西都得自己把账算清楚。</p>
+     */
+    public static boolean isBoxPart(ItemStack template) {
+        if (template == null || template.isEmpty()) {
+            return false;
+        }
+        return template.is(Items.SHULKER_SHELL) || template.is(Items.CHEST);
     }
 
     /**

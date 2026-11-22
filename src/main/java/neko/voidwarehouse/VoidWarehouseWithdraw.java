@@ -105,6 +105,12 @@ public final class VoidWarehouseWithdraw {
                 "Not enough of that item in the warehouse — cancelled");
     }
 
+    private static Component msgNoIngredients(boolean en) {
+        return VoidWarehouseText.info(en,
+                "原料不够，做不出这么多个 —— 仓库没有任何变化",
+                "Not enough ingredients to craft that — nothing was taken");
+    }
+
     private static Component msgNoParts(boolean en) {
         return VoidWarehouseText.info(en, "空盒 / 潜影壳 / 箱子不足，无法装盒，本次取消",
                 "Not enough empty boxes / shells / chests to pack — cancelled");
@@ -116,7 +122,7 @@ public final class VoidWarehouseWithdraw {
     }
 
     /** 一条待处理请求：记录要取的是哪种物品（样板，数量恒 1）+ 发起时间 */
-    private record Pending(ItemStack sample, long createdMs) {
+    private record Pending(ItemStack sample, long createdMs, boolean forceCraft) {
     }
 
     /** 玩家 UUID → 待处理请求（瞬时状态，服务器重启即失效，无需持久化） */
@@ -134,10 +140,20 @@ public final class VoidWarehouseWithdraw {
      * 执行时用 {@link VoidWarehouseData#takeExact} 按「物品 + 数据组件」精确扣减。</p>
      */
     public static void request(ServerPlayer player, ItemStack sample) {
+        request(player, sample, false);
+    }
+
+    /**
+     * @param forceCraft {@code true} = 合成页的配方条目：这 N 个必须<b>扣原料做出来</b>，
+     *                   不许拿仓库里现成的抵数（见 {@link VoidWarehouseData#planCraftedMax}）。
+     *                   盒子模式的右键走这条；普通模式的右键在菜单里直接取 1 个，不经过这里。
+     */
+    public static void request(ServerPlayer player, ItemStack sample, boolean forceCraft) {
         if (sample == null || sample.isEmpty()) {
             return;
         }
-        PENDING.put(player.getUUID(), new Pending(sample.copyWithCount(1), System.currentTimeMillis()));
+        PENDING.put(player.getUUID(),
+                new Pending(sample.copyWithCount(1), System.currentTimeMillis(), forceCraft));
         // 先关掉仓库界面：聊天栏被界面盖着，输入时看不见自己打了什么。
         // 取完货（或取消）会由 onChat 统一开回来，见 reopenWarehouse。
         player.closeContainer();
@@ -152,11 +168,9 @@ public final class VoidWarehouseWithdraw {
      * 玩家不会丢失自己翻到的那一页。</p>
      */
     private static void reopenWarehouse(ServerPlayer player) {
-        // 标题跟随玩家语言：英文玩家重开的界面也该是英文标题（与触发名对应）
-        boolean en = VoidWarehouseText.isEnglish(player);
-        VoidWarehouse.open(player, Component.literal(
-                VoidWarehouseText.tr(en,
-                        VoidWarehouseProvider.TITLE_TEXT, VoidWarehouseText.TITLE_TEXT_EN)));
+        // 标题按玩家语言取默认值：英文玩家重开的界面也该是英文标题（与触发名对应）。
+        // 与触发入口「手里不是仓库」时走同一条兜底，标题口径只有一个来源。
+        VoidWarehouse.open(player, VoidWarehouseProvider.defaultTitle(player));
     }
 
     /** 玩家有没有一条待处理请求 */
@@ -197,7 +211,7 @@ public final class VoidWarehouseWithdraw {
                 player.sendSystemMessage(msgTooLarge(en));
                 consumed = true;
             } else {
-                execute(player, pending.sample(), requested);
+                execute(player, pending.sample(), requested, pending.forceCraft());
                 consumed = true;
             }
         }
@@ -213,7 +227,72 @@ public final class VoidWarehouseWithdraw {
      *
      * <p>顺序与 {@code withdrawShulkerBox} 一致：先校验 → 生成产物 → 检查背包 → 放成功才扣账。</p>
      */
-    private static void execute(ServerPlayer player, ItemStack sample, long requested) {
+    private static void execute(ServerPlayer player, ItemStack sample, long requested,
+                                boolean forceCraft) {
+        executeCore(player, sample, requested, true, forceCraft);
+    }
+
+    /**
+     * 一次取货该走哪条账。抽成类型而不是两个布尔，是因为它有<b>三种</b>结果，
+     * {@code null} 表示不了，而「做不出来」与「库存够、直接扣」混淆的代价是扣错东西。
+     *
+     * @param plan      非空 = 执行这笔兑换 / 配方计划（原子，失败可整体回滚）
+     * @param fromStock {@code true} = 库存够，直接按量扣 {@code sample} 的现货
+     */
+    record Take(VoidWarehouseExchange.Plan plan, boolean fromStock) {
+
+        /** 三种结果都拿不到：既没有计划、也不该扣现货 —— 这次取货必须整次拒绝 */
+        boolean failed() {
+            return this.plan == null && !this.fromStock;
+        }
+    }
+
+    /**
+     * 取货的记账决策，<b>合成页与普通格的分水岭就在这一个方法里</b>。
+     *
+     * <h2>两条口径</h2>
+     * <ul>
+     *   <li><b>普通格</b>（{@code forceCraft = false}）：成品有货就直接扣成品，不够才问兑换。
+     *       现成的东西没有理由再做一遍 —— 补货、漏斗、按量取货都是这个口径。</li>
+     *   <li><b>合成页</b>（{@code forceCraft = true}）：<b>只看原料</b>，跳过成品库存与 9 合 1。
+     *       玩家点的是「可合成 580」那一格，要的是「扣原料、给我新做的」。2026-11-21
+     *       玩家实测：右键「按数量取货」与 Ctrl+Alt 填满在合成页仍然扣成品库存 ——
+     *       就是因为这两条路原来直接问 {@link VoidWarehouseData#amountExact}。</li>
+     * </ul>
+     *
+     * <p>抽成单独方法的第二个理由是<b>能被自检直接咬</b>：它是一个纯决策函数，
+     * 不需要玩家、背包或网络，S 组就能断言「有现货时合成页口径仍然返回计划、
+     * 且账里没有成品项」。</p>
+     */
+    static Take planTake(VoidWarehouseData data, ItemStack sample, BigInteger want,
+                         boolean forceCraft) {
+        if (forceCraft) {
+            VoidWarehouseExchange.Plan plan = data.planCraftedMax(sample, want);
+            return plan == null ? new Take(null, false) : new Take(plan, false);
+        }
+        if (data.amountExact(sample).compareTo(want) >= 0) {
+            return new Take(null, true);
+        }
+        VoidWarehouseExchange.Plan plan = data.planExchange(sample, want);
+        return plan == null ? new Take(null, false) : new Take(plan, false);
+    }
+
+    /**
+     * 取货的核心，{@code allowBox} 决定「允不允许顺手装盒」。
+     *
+     * <h2>为什么要这个开关</h2>
+     * <p>「按数量取货」（右键输入数字）希望散货多了就装盒 —— 那是省背包格子。
+     * 但「Ctrl+Alt+左键 填满背包」在<b>常规模式</b>下的语义是「把格子铺满」，
+     * 玩家要的就是一片能顺手拿的散货；这时若悄悄给成盒子，点一下背包里冒出个
+     * 装着 1728 个圆石的潜影盒，跟玩家的预期完全对不上。
+     * 所以填满这条路明确传 {@code false}，<b>一个盒子都不装</b>。</p>
+     *
+     * @param allowBox   {@code false} = 绝不装盒，请求多少就给多少散货
+     * @param forceCraft {@code true} = 合成页的配方条目：这 N 个靠扣原料做出来，
+     *                   成品库存与 9 合 1 都不参与（见 {@link #planTake}）
+     */
+    private static void executeCore(ServerPlayer player, ItemStack sample, long requested,
+                                    boolean allowBox, boolean forceCraft) {
         boolean en = VoidWarehouseText.isEnglish(player);
         VoidWarehouseData data = VoidWarehouse.data(player.level().getServer());
         if (data == null) {
@@ -226,45 +305,63 @@ public final class VoidWarehouseWithdraw {
         //   （planBoxMaterials 空盒优先），takeExact 先把它扣空之后材料就扣不到了 ——
         //   于是「取 5 个盒子出来 6 个」、送回仓库后壳和箱无限增长（2026-11 事故）。
         //   盒子本来就是盒子，直接给。见 VoidWarehouseShulker#isBoxable。
-        boolean boxTarget = !VoidWarehouseShulker.isBoxable(sample);
-        long fullBoxes = boxTarget ? 0 : requested / capacity;
-        long loose = boxTarget ? requested : requested % capacity;
+        // allowBox = false 与「目标本身是潜影盒」是同一件事：都不许再包一层。
+        //   「目标本身是盒子材料」（潜影壳 / 箱子）不走这条：那两样<b>仍然可以装盒</b>，
+        //   只要材料账把那批货先刨掉 —— 见下面 ② 的预留。见 VoidWarehouseShulker#isBoxPart。
+        boolean noPacking = !allowBox || !VoidWarehouseShulker.isBoxable(sample);
+        long fullBoxes = noPacking ? 0 : requested / capacity;
+        long loose = noPacking ? requested : requested % capacity;
         // 散货超过 LOOSE_PACK_STACKS 组：它单独要占掉一大片背包格子，顺手装进一个盒子
         // （这个盒子同样要算材料，所以盒子总数是 fullBoxes + 1）
-        boolean packLoose = !boxTarget && loose > (long) LOOSE_PACK_STACKS * max;
+        boolean packLoose = !noPacking && loose > (long) LOOSE_PACK_STACKS * max;
         long totalBoxes = packLoose ? fullBoxes + 1 : fullBoxes;
 
         // ① 校验物品库存（精确口径：同物品 + 同数据组件，与 takeExact 一致）。
         //    成品不够时，规则允许就用 9 合 1 兑换补齐 —— 规划是「先扣成品、再动别的」，
         //    所以有成品一定先用成品，玩家不会遇到「明明有铁锭却被扣了铁粒」。
         BigInteger want = BigInteger.valueOf(requested);
-        VoidWarehouseExchange.Plan exchange = null;
-        if (data.amountExact(sample).compareTo(want) < 0) {
-            exchange = data.planExchange(sample, want);
-            if (exchange == null) {
-                player.sendSystemMessage(msgNoStock(en));
-                return;
-            }
+        // ① 这次走哪条账 —— 合成页只看原料，普通格先吃现货。见 planTake。
+        Take take = planTake(data, sample, want, forceCraft);
+        if (take.failed()) {
+            // 合成页失败 = 原料不够（<b>绝不</b>退回「先吃现货」，那正是 2026-11-21 报的错口径）；
+            // 普通格失败 = 成品不够、并且兑不出来
+            player.sendSystemMessage(forceCraft ? msgNoIngredients(en) : msgNoStock(en));
+            return;
         }
+        VoidWarehouseExchange.Plan exchange = take.plan();
 
         // ② 校验盒子材料：优先空盒，不够的用壳 + 箱（按 totalBoxes 算，含散货装出来的那个）。
         //    与界面里「点击取一盒」共用同一份算法，两边行为必须一致。
+        //
+        //    🔴 <b>目标物本身就是盒子材料时（潜影壳 / 箱子），必须先把「马上要离库的那批」扣掉</b>：
+        //    材料账是「先验 → 取货 → 再扣」，同一格里既当货又当材料就会让外盒白送
+        //    （1728 壳 + 1 箱 → 「1 箱换 1 盒」无限循环，见 VoidWarehouseShulker#isBoxPart）。
+        //    走兑换时只有「这一格里的成品」会离库，所以预留量取两者的较小值。
+        //    合成页这一格<b>一件成品都不动</b>，要预留的自然是 0。
+        BigInteger leaving = forceCraft ? BigInteger.ZERO
+                : (exchange == null ? want : data.amountExact(sample).min(want));
         VoidWarehouseData.BoxMaterials plan = data.planBoxMaterials(totalBoxes);
-        if (!data.hasBoxMaterials(plan)) {
+        if (!data.hasBoxMaterials(plan, sample, leaving)) {
             player.sendSystemMessage(msgNoParts(en));
             return;
         }
 
         // ③ 生成产物：若干满盒 + （散货要么装盒、要么按组拆成散件）
+        // 🔴 走过兑换 / 配方扣料时，新做出来的那部分只是 (物品, 数量) ——
+        //    数据组件一个都复现不出来。继续拿 sample 复制，就等于把它的改名 / 附魔 /
+        //    盒内物品白送一遍（装满的潜影盒在这儿是「1 个空盒换 1728 个圆石」）。
+        //    与 VoidWarehouseData#withdraw 第 ② 段是同一个坑，同一个口径。
+        //    没动过合成时 sample 本来就是仓库里真实的那一格，原样保留。
+        ItemStack goods = goodsTemplate(sample, exchange != null);
         List<ItemStack> outputs = new ArrayList<>();
         for (long i = 0; i < fullBoxes; i++) {
-            outputs.add(VoidWarehouseShulker.pack(sample, capacity));
+            outputs.add(VoidWarehouseShulker.pack(goods, capacity));
         }
         if (packLoose) {
             // 散货装盒：这一盒没装满（loose < capacity），但只占 1 个背包格
-            outputs.add(VoidWarehouseShulker.pack(sample, loose));
+            outputs.add(VoidWarehouseShulker.pack(goods, loose));
         } else {
-            appendLoose(outputs, sample, loose);
+            appendLoose(outputs, goods, loose);
         }
         if (outputs.isEmpty()) {
             return;
@@ -290,6 +387,201 @@ public final class VoidWarehouseWithdraw {
         }
         data.consumeBoxMaterials(plan);
         player.sendSystemMessage(successMessage(en, sample, requested, fullBoxes, loose, packLoose));
+    }
+
+    // ------------------------------------------------------------------ 填满背包
+
+    /**
+     * Ctrl + Alt + 左键：<b>把这一格的物品取出，装到背包放不下为止</b>。
+     *
+     * <h2>两种模式的语义不同，必须分开算</h2>
+     * <table border="1">
+     *   <tr><th>模式</th><th>给什么</th><th>「装得下多少」怎么算</th></tr>
+     *   <tr><td>常规</td><td><b>纯散货</b>，一个盒子都不装</td>
+     *       <td>每个格子还能塞多少（同类格算余量、空格算一整叠）之和</td></tr>
+     *   <tr><td>潜影盒</td><td><b>满盒</b>，一格一个</td>
+     *       <td>空格数 × 一盒容量</td></tr>
+     * </table>
+     * <p>常规模式特意<b>不许</b>装盒：玩家要的是「顺手能拿的一片散货」。
+     * 悄悄给成盒子会跟预期对不上（见 {@link #executeCore} 的 {@code allowBox}）。</p>
+     *
+     * <h2>三个上限取最小</h2>
+     * <ol>
+     *   <li><b>背包放得下多少</b> —— 主判据，这个功能的名字就叫「填满背包」；</li>
+     *   <li><b>仓库有多少</b> —— 只取现有的，<b>绝不走 9 合 1 兑换补齐</b>
+     *       （与「按数量取货」不同：那是玩家明确要 N 个，这里是「有多少给我多少」）；</li>
+     *   <li>盒模式下还有<b>材料够做几个盒子</b>（空盒优先，其次壳 + 箱）。</li>
+     * </ol>
+     *
+     * <h2>为什么这里不用 All-or-nothing 的取消语义</h2>
+     * <p>「按数量取货」是玩家点了名要 N 个，给不够就该整单取消。
+     * 填满背包没有「要多少个」这个前提 —— 能装多少就装多少，取到的数量由上面三个上限
+     * 里最小的那个决定，所以它天然是<b>「按上限裁剪」</b>而不是「不够就取消」。
+     * 唯一会全盘拒绝的情形是「一个都装不下 / 一个都没有」，那时发一句提示就结束。</p>
+     */
+    public static void fill(ServerPlayer player, ItemStack sample, boolean boxMode) {
+        fill(player, sample, boxMode, false);
+    }
+
+    /**
+     * @param forceCraft {@code true} = 合成页的配方条目：能取多少<b>由原料决定</b>，
+     *                   不是由成品库存决定（走 {@link VoidWarehouseData#planCraftedMax}）。
+     *                   盒子材料（空盒 / 壳 / 箱）照旧真的从仓库扣。
+     */
+    public static void fill(ServerPlayer player, ItemStack sample, boolean boxMode,
+                            boolean forceCraft) {
+        if (player == null || sample == null || sample.isEmpty()) {
+            return;
+        }
+        boolean en = VoidWarehouseText.isEnglish(player);
+        VoidWarehouseData data = VoidWarehouse.data(player.level().getServer());
+        if (data == null) {
+            return;
+        }
+
+        // 盒子材料（潜影壳 / 箱子）<b>也走这个分支</b>：它们可以装盒，只要材料账先把
+        // 「马上要装走的那批」刨掉。能凑几盒由 maxBoxesUpTo(limit, sample) 现算 ——
+        // 不带预留的那个重载会把要装走的壳/箱算成可用材料（见 VoidWarehouseShulker#isBoxPart）。
+        if (boxMode && VoidWarehouseShulker.isBoxable(sample)) {
+            long capacity = VoidWarehouseShulker.capacity(sample);
+            int freeSlots = emptySlots(player);
+            if (freeSlots <= 0) {
+                player.sendSystemMessage(msgInvFull(en));
+                return;
+            }
+            long byMaterial = data.maxBoxesUpTo(freeSlots, sample);
+            // 「货有多少」两个来源：合成页问原料能做多少，普通格看现货。
+            long byStock;
+            if (forceCraft) {
+                byStock = craftableUpTo(data, sample, (long) freeSlots * capacity) / capacity;
+            } else {
+                long have = stockOf(data, sample);
+                if (have <= 0) {
+                    player.sendSystemMessage(msgFillNoStock(en));
+                    return;
+                }
+                byStock = have / capacity;
+            }
+            long boxes = Math.min(Math.min((long) freeSlots, byMaterial), byStock);
+            if (boxes <= 0) {
+                // 「一个盒子都给不出」的原因分开说清楚，别让玩家去猜
+                if (byStock <= 0) {
+                    if (forceCraft) {
+                        player.sendSystemMessage(msgNoIngredients(en));
+                    } else {
+                        player.sendSystemMessage(
+                                msgFillNotEnoughForBox(en, capacity, stockOf(data, sample)));
+                    }
+                } else {
+                    player.sendSystemMessage(msgNoParts(en));
+                }
+                return;
+            }
+            executeCore(player, sample, boxes * capacity, true, forceCraft);
+            return;
+        }
+
+        long room = looseRoom(player, sample);
+        if (room <= 0) {
+            player.sendSystemMessage(msgInvFull(en));
+            return;
+        }
+        long take;
+        if (forceCraft) {
+            take = craftableUpTo(data, sample, room);
+            if (take <= 0) {
+                player.sendSystemMessage(msgNoIngredients(en));
+                return;
+            }
+        } else {
+            long have = stockOf(data, sample);
+            if (have <= 0) {
+                player.sendSystemMessage(msgFillNoStock(en));
+                return;
+            }
+            take = Math.min(room, have);
+        }
+        executeCore(player, sample, take, false, forceCraft);
+    }
+
+    /** 仓库里能拿多少个 {@code sample} 的现货（截到 long；没货返回 0） */
+    private static long stockOf(VoidWarehouseData data, ItemStack sample) {
+        BigInteger stock = data.amountExact(sample);
+        if (stock.signum() <= 0) {
+            return 0;
+        }
+        return stock.min(BigInteger.valueOf(Long.MAX_VALUE)).longValue();
+    }
+
+    /**
+     * 合成页口径下最多能取几个 {@code sample}（纯规划，不动仓库）。
+     *
+     * <p>{@code limit} 是调用方给的硬上限（背包还能塞多少 / 空格数 × 一盒容量），
+     * 规划器按它裁剪 —— 传一个「很大」的数去问，只会让递归多走几十层，
+     * 换来的还是同一个背包上限。</p>
+     */
+    static long craftableUpTo(VoidWarehouseData data, ItemStack sample, long limit) {
+        if (limit <= 0) {
+            return 0;
+        }
+        VoidWarehouseExchange.Plan plan =
+                data.planCraftedMax(sample, BigInteger.valueOf(limit));
+        return plan == null ? 0 : plan.amount().longValue();
+    }
+
+    /**
+     * 背包里还能吸收多少个 {@code sample}（同类格算余量、空格算一整叠）。
+     *
+     * <p>🔴 只数<b>那 36 格</b>（{@link Inventory#INVENTORY_SIZE}），不是
+     * {@code getContainerSize()} —— 后者在 26.3 是 <b>43</b>（36 格 + 副手 + 身体盔甲 + 鞍），
+     * 拿它当「背包容量」会把副手和盔甲槽也算成能塞圆石的地方，
+     * 于是「填满背包」实际会往副手里塞一组石头（实测踩过：算出 2752 = 43×64）。</p>
+     */
+    static long looseRoom(Player player, ItemStack sample) {
+        Inventory inv = player.getInventory();
+        int max = Math.max(1, sample.getMaxStackSize());
+        long room = 0;
+        for (int i = 0; i < Inventory.INVENTORY_SIZE; i++) {
+            ItemStack slot = inv.getItem(i);
+            if (slot.isEmpty()) {
+                room += max;
+            } else if (ItemStack.isSameItemSameTags(slot, sample)) {
+                room += Math.max(0, Math.max(1, slot.getMaxStackSize()) - slot.getCount());
+            }
+        }
+        return room;
+    }
+
+    /** 背包里有几个完全空着的格子（潜影盒一格一个，装不了盒就只能算空格）；只数那 36 格 */
+    static int emptySlots(Player player) {
+        Inventory inv = player.getInventory();
+        int n = 0;
+        for (int i = 0; i < Inventory.INVENTORY_SIZE; i++) {
+            if (inv.getItem(i).isEmpty()) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    private static Component msgFillNoStock(boolean en) {
+        return VoidWarehouseText.info(en, "仓库里没有这种物品了",
+                "The warehouse has none of that item left");
+    }
+
+    /** 仓库里不够装满一整盒 —— 把「还差多少」说出来，玩家才知道要不要再攒 */
+    private static Component msgFillNotEnoughForBox(boolean en, long capacity, long have) {
+        return VoidWarehouseText.info(en,
+                VoidWarehouseText.body("仓库里不够装满一整盒（一盒 ")
+                        .append(VoidWarehouseText.key(VoidWarehouseText.count(capacity)))
+                        .append(VoidWarehouseText.body("，现有 "))
+                        .append(VoidWarehouseText.key(VoidWarehouseText.count(have)))
+                        .append(VoidWarehouseText.body("）")),
+                VoidWarehouseText.body("Not enough for even one full box (needs ")
+                        .append(VoidWarehouseText.key(VoidWarehouseText.count(capacity)))
+                        .append(VoidWarehouseText.body(", have "))
+                        .append(VoidWarehouseText.key(VoidWarehouseText.count(have)))
+                        .append(VoidWarehouseText.body(")")));
     }
 
     /**
@@ -345,6 +637,25 @@ public final class VoidWarehouseWithdraw {
     // ------------------------------------------------------------------ 背包
 
     /**
+     * 交出去的「货」该用哪个样板。
+     *
+     * <p><b>没动过合成</b>（{@code synthesized == false}）→ 就用调用方给的那一格：
+     * 它本来就是仓库里真实存在的东西，数据组件必须原样保留（改过名的、附魔的、
+     * 带盒内物品的，取出来还得是那一件）。</p>
+     *
+     * <p><b>动过合成 / 兑换</b> → <b>只能用纯净产物</b>。因为合成层只认
+     * {@code (物品, 数量)}，数据组件一个都复现不出来；继续拿 {@code sample} 复制
+     * 就等于把它身上挂着的东西白送一遍 —— 装满的潜影盒在这儿是
+     * 「1 个空盒换 1728 个圆石」，改名物品则是名字被无限复制。
+     * 与 {@link VoidWarehouseData#withdraw} 第 ② 段同一条口径。</p>
+     *
+     * <p>抽成包内可见的纯函数是为了<b>能单测</b>：真正的执行路径要一个
+     * {@code ServerPlayer}，而这条判断本身与玩家无关。</p>
+     */
+    static ItemStack goodsTemplate(ItemStack sample, boolean synthesized) {
+        return synthesized ? new ItemStack(sample.getItem()) : sample;
+    }
+    /**
      * 把 {@code count} 个散货按该物品的 {@code maxStackSize} 拆成若干<b>满堆叠</b> +
      * 至多一个<b>余数堆叠</b>，追加进 {@code outputs}。
      *
@@ -375,7 +686,9 @@ public final class VoidWarehouseWithdraw {
      */
     private static boolean canFitAll(Player player, List<ItemStack> outputs) {
         Inventory inv = player.getInventory();
-        int size = inv.getContainerSize();
+        // 🔴 36，不是 getContainerSize()（26.3 那是 43，含副手 / 身体盔甲 / 鞍）。
+        // 用 43 的话「放得下」会把副手格也算进去，取货就会往副手里塞一组东西。
+        int size = Inventory.INVENTORY_SIZE;
         List<ItemStack> sim = new ArrayList<>(size);
         for (int i = 0; i < size; i++) {
             sim.add(inv.getItem(i).copy());
@@ -413,8 +726,8 @@ public final class VoidWarehouseWithdraw {
     /** 把产物真正放进背包（调用方已用 {@link #canFitAll} 确认能全部放下） */
     private static void moveIntoInventory(Player player, ItemStack stack) {
         Inventory inv = player.getInventory();
-        // 先合并进同类格
-        int size = inv.getContainerSize();
+        // 先合并进同类格（同样只认那 36 格，理由见 canFitAll）
+        int size = Inventory.INVENTORY_SIZE;
         for (int i = 0; i < size && !stack.isEmpty(); i++) {
             ItemStack slot = inv.getItem(i);
             if (slot.isEmpty() || !ItemStack.isSameItemSameTags(slot, stack)) {

@@ -1,6 +1,5 @@
 package neko.voidwarehouse.search;
 
-
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.server.level.ServerPlayer;
@@ -66,9 +65,9 @@ public final class SearchNetwork {
      * 客户端不发自己那份注册就退化成 {@code DiscardedPayload}，包整包丢掉。</p>
      */
     public static void init() {
-        ServerPlayNetworking.registerGlobalReceiver(SearchHelloPayload.TYPE,
+        ServerPlayNetworking.registerGlobalReceiver(SearchHelloPayload.TYPE.id(),
                 (server, player, handler, buf, sender) -> server.execute(() -> handleHello(SearchHelloPayload.INSTANCE, player)));
-        ServerPlayNetworking.registerGlobalReceiver(SearchApplyPayload.TYPE,
+        ServerPlayNetworking.registerGlobalReceiver(SearchApplyPayload.TYPE.id(),
                 (server, player, handler, buf, sender) -> {
                     SearchApplyPayload payload = SearchApplyPayload.decode(buf);
                     server.execute(() -> handleApply(payload, player));
@@ -141,9 +140,9 @@ public final class SearchNetwork {
     /** 发之前先问 {@code canSend}：对端没这条通道就别发，省一次编码 */
     private static void send(ServerPlayer player, SearchCatalogPayload payload) {
         if (player == null
-                || !ServerPlayNetworking.canSend(player, SearchCatalogPayload.TYPE)) {
+                || !ServerPlayNetworking.canSend(player, SearchCatalogPayload.TYPE.id())) {
             return;
         }
-        ServerPlayNetworking.send(player, SearchCatalogPayload.TYPE, payload.encode());
+        ServerPlayNetworking.send(player, SearchCatalogPayload.TYPE.id(), payload.encode());
     }
 }

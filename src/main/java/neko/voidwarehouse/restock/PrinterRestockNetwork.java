@@ -1,7 +1,5 @@
 package neko.voidwarehouse.restock;
 
-
-
 import neko.compat.PayloadTypeRegistry;
 
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
@@ -10,19 +8,13 @@ import neko.compat.ServerPlayNetworking;
 
 import net.minecraft.server.level.ServerPlayer;
 
-
-
 import java.util.Map;
 
 import java.util.UUID;
 
 import java.util.concurrent.ConcurrentHashMap;
 
-
-
 import neko.voidwarehouse.VoidWarehouseText;
-
-
 
 /**
 
@@ -56,8 +48,6 @@ import neko.voidwarehouse.VoidWarehouseText;
 
 public final class PrinterRestockNetwork {
 
-
-
     /**
 
      * 同一玩家两次取货请求之间的<b>最短毫秒间隔</b>。
@@ -74,8 +64,6 @@ public final class PrinterRestockNetwork {
 
     private static final long MIN_INTERVAL_MS = 50L;
 
-
-
     /**
 
      * 每个玩家上次请求的墙钟时间，用于限流。
@@ -90,13 +78,9 @@ public final class PrinterRestockNetwork {
 
     private static final Map<UUID, Long> LAST_REQUEST_AT = new ConcurrentHashMap<>();
 
-
-
     private PrinterRestockNetwork() {
 
     }
-
-
 
     /**
 
@@ -168,11 +152,7 @@ public final class PrinterRestockNetwork {
 
         PayloadTypeRegistry.playS2C().register(PrinterTakeResultPayload.TYPE, PrinterTakeResultPayload.CODEC);
 
-
-
         ServerPlayNetworking.registerGlobalReceiver(PrinterTakePayload.TYPE, PrinterRestockNetwork::handle);
-
-
 
         // 玩家下线就把限流记录抹掉，否则长期运行的服务器会一直攒着离线玩家的 UUID
 
@@ -189,8 +169,6 @@ public final class PrinterRestockNetwork {
         });
 
     }
-
-
 
     /**
 
@@ -210,8 +188,6 @@ public final class PrinterRestockNetwork {
 
         int nonce = payload.nonce();
 
-
-
         if (isThrottled(player)) {
 
             reply(player, nonce, PrinterTakeResultPayload.THROTTLED);
@@ -219,8 +195,6 @@ public final class PrinterRestockNetwork {
             return;
 
         }
-
-
 
         PrinterTakeService.TakeOutcome outcome =
 
@@ -231,8 +205,6 @@ public final class PrinterRestockNetwork {
         notifyTaken(player, outcome);
 
     }
-
-
 
     /**
 
@@ -320,8 +292,6 @@ public final class PrinterRestockNetwork {
 
     }
 
-
-
     /**
 
      * @return {@code true} = 发得太快，本次请求不作数
@@ -339,8 +309,6 @@ public final class PrinterRestockNetwork {
         UUID id = player.getUUID();
 
         long now = System.currentTimeMillis();
-
-
 
         Long previous = LAST_REQUEST_AT.get(id);
 
@@ -361,8 +329,6 @@ public final class PrinterRestockNetwork {
         return false;
 
     }
-
-
 
     /**
 

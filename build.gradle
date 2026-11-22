@@ -1,5 +1,5 @@
 plugins { id 'fabric-loom' version '1.5.8' }
-version = '1.0.17-mc1.20.1'
+version = '1.0.18-mc1.20.1'
 group = 'neko'
 base { archivesName = 'carpet-Neko-Addition' }
 repositories { maven { url 'https://masa.dy.fi/maven' }; mavenCentral() }
